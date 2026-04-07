@@ -67,6 +67,7 @@ json task_params::to_json(bool only_metrics) const {
             {"n_discard",                 n_discard},
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
+            {"banned_strings",            banned_strings},
             {"n_probs",                   sampling.n_probs},
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
@@ -125,6 +126,7 @@ json task_params::to_json(bool only_metrics) const {
         {"n_discard",                 n_discard},
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
+        {"banned_strings",            banned_strings},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
         {"n_probs",                   sampling.n_probs},
         {"min_keep",                  sampling.min_keep},
@@ -272,6 +274,7 @@ task_params server_task::params_from_json_cmpl(
     //params.t_max_prompt_ms  = json_value(data,       "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
+    params.banned_strings   = json_value(data,       "banned_strings",     std::vector<std::string>());
 
     params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
     params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);

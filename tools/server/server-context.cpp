@@ -47,6 +47,23 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+enum banned_match_status {
+    BANNED_MATCH_CLEAR,
+    BANNED_MATCH_PARTIAL,
+    BANNED_MATCH_FULL,
+};
+
+struct banned_match_result {
+    banned_match_status status = BANNED_MATCH_CLEAR;
+    size_t match_pos = std::string::npos;
+    size_t match_len = 0;
+};
+
+struct banned_hold_checkpoint {
+    int32_t prompt_n_tokens = -1;
+    common_sampler_ptr sampler;
+};
+
 struct server_slot {
     int id;
 
@@ -81,6 +98,11 @@ struct server_slot {
     std::string  generated_text;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
+    std::vector<completion_token_output> held_token_outputs;
+    std::vector<banned_hold_checkpoint> held_checkpoints;
+    std::string  held_text;
+    llama_pos rewind_last_pos = -1;
+    std::vector<llama_token> rewind_failed_tokens;
 
     // idx of draft tokens in the main batch
     // non-empty if we went to evaluate draft tokens
@@ -92,6 +114,7 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool task_erred     = false;
 
     stop_type stop;
 
@@ -173,6 +196,7 @@ struct server_slot {
         generated_text = "";
         has_new_line   = false;
         truncated      = false;
+        task_erred     = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -181,6 +205,11 @@ struct server_slot {
         i_batch_dft.clear();
         generated_tokens.clear();
         generated_token_probs.clear();
+        held_token_outputs.clear();
+        held_checkpoints.clear();
+        held_text.clear();
+        rewind_last_pos = -1;
+        rewind_failed_tokens.clear();
         json_schema = json();
 
         // clear speculative decoding stats
@@ -259,7 +288,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && task && task->params.banned_strings.empty();
     }
 
     void add_token(const completion_token_output & token) {
@@ -452,6 +481,11 @@ struct server_slot {
 
         other.prompt = prompt.clone();
         other.init_sampler();
+        other.held_token_outputs.clear();
+        other.held_checkpoints.clear();
+        other.held_text.clear();
+        other.rewind_last_pos = -1;
+        other.rewind_failed_tokens.clear();
     }
 };
 
@@ -1190,6 +1224,7 @@ private:
             bool backend_sampling = true;
 
             backend_sampling &= task.params.sampling.backend_sampling;
+            backend_sampling &= task.params.banned_strings.empty();
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
             backend_sampling &= !(slot.spec && task.params.speculative.n_max > 0);
@@ -1222,7 +1257,57 @@ private:
         return true;
     }
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    banned_match_result check_banned_strings(const server_slot & slot) const {
+        const size_t valid_size = validate_utf8(slot.held_text);
+        const std::string_view text(slot.held_text.data(), valid_size);
+        banned_match_result result;
+        bool partial_match = valid_size < slot.held_text.size();
+
+        for (const std::string & banned : slot.task->params.banned_strings) {
+            if (banned.empty()) {
+                continue;
+            }
+
+            const size_t full_match = text.find(banned, 0);
+            if (full_match != std::string_view::npos) {
+                if (result.status != BANNED_MATCH_FULL || full_match < result.match_pos) {
+                    result.status = BANNED_MATCH_FULL;
+                    result.match_pos = full_match;
+                    result.match_len = banned.size();
+                }
+            }
+
+            partial_match = partial_match || string_find_partial_stop(text, banned) != std::string_view::npos;
+        }
+
+        if (result.status == BANNED_MATCH_FULL) {
+            return result;
+        }
+
+        result.status = partial_match ? BANNED_MATCH_PARTIAL : BANNED_MATCH_CLEAR;
+        return result;
+    }
+
+    void clear_banned_hold(server_slot & slot) {
+        slot.held_token_outputs.clear();
+        slot.held_checkpoints.clear();
+        slot.held_text.clear();
+    }
+
+    size_t find_banned_match_token_index(const server_slot & slot, size_t match_pos) const {
+        size_t text_pos = 0;
+        for (size_t i = 0; i < slot.held_token_outputs.size(); ++i) {
+            const size_t token_size = slot.held_token_outputs[i].text_to_send.size();
+            if (match_pos < text_pos + token_size) {
+                return i;
+            }
+            text_pos += token_size;
+        }
+
+        return slot.held_token_outputs.size();
+    }
+
+    bool process_visible_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -1353,10 +1438,139 @@ private:
         return slot.has_next_token; // continue
     }
 
+    bool flush_held_tokens(server_slot & slot) {
+        auto held = std::move(slot.held_token_outputs);
+        clear_banned_hold(slot);
+
+        for (auto & held_result : held) {
+            if (!process_visible_token(held_result, slot)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool fail_generation_on_banned_strings(server_slot & slot, const char * reason) {
+        SLT_WRN(slot, "failing generation for banned_strings: %s\n", reason);
+        clear_banned_hold(slot);
+        slot.task_erred = true;
+        send_error(slot, std::string("banned_strings ") + reason, ERROR_TYPE_SERVER);
+        return false;
+    }
+
+    bool process_token(completion_token_output & result, server_slot & slot, int logits_idx = -1) {
+        slot.sampled = result.tok;
+
+        if (slot.task->params.banned_strings.empty()) {
+            common_sampler_accept(slot.smpl.get(), result.tok, true);
+            return process_visible_token(result, slot);
+        }
+
+        slot.held_checkpoints.push_back({
+                /*.prompt_n_tokens =*/ (int32_t) slot.prompt.n_tokens(),
+                /*.sampler         =*/ common_sampler_ptr(common_sampler_clone(slot.smpl.get())),
+        });
+        slot.held_token_outputs.push_back(result);
+        slot.held_text += result.text_to_send;
+
+        const auto banned_match = check_banned_strings(slot);
+
+        switch (banned_match.status) {
+            case BANNED_MATCH_CLEAR:
+                common_sampler_accept(slot.smpl.get(), result.tok, true);
+                slot.rewind_last_pos = -1;
+                slot.rewind_failed_tokens.clear();
+                return flush_held_tokens(slot);
+            case BANNED_MATCH_PARTIAL:
+                common_sampler_accept(slot.smpl.get(), result.tok, true);
+                return true;
+            case BANNED_MATCH_FULL:
+                break;
+        }
+
+        const size_t banned_token_idx = find_banned_match_token_index(slot, banned_match.match_pos);
+        if (banned_token_idx >= slot.held_token_outputs.size() || banned_token_idx >= slot.held_checkpoints.size()) {
+            slot.task_erred = true;
+            send_error(slot, "banned_strings failed to locate offending token", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        const int32_t rewind_prompt_n_tokens = slot.held_checkpoints[banned_token_idx].prompt_n_tokens;
+        const bool has_rewind_sampler = slot.held_checkpoints[banned_token_idx].sampler != nullptr;
+        if (rewind_prompt_n_tokens < 0 || !has_rewind_sampler || logits_idx < 0) {
+            slot.task_erred = true;
+            send_error(slot, "banned_strings rewind state is incomplete", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        if (slot.rewind_last_pos != rewind_prompt_n_tokens) {
+            slot.rewind_last_pos = rewind_prompt_n_tokens;
+            slot.rewind_failed_tokens.clear();
+        }
+
+        const llama_token banned_token = slot.held_token_outputs[banned_token_idx].tok;
+        if (std::find(slot.rewind_failed_tokens.begin(), slot.rewind_failed_tokens.end(), banned_token) == slot.rewind_failed_tokens.end()) {
+            slot.rewind_failed_tokens.push_back(banned_token);
+        }
+
+        SLT_WRN(slot, "rewinding banned_strings branch at pos %d after matching '%s'\n",
+                rewind_prompt_n_tokens, slot.held_text.c_str());
+
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, rewind_prompt_n_tokens, -1)) {
+            slot.task_erred = true;
+            send_error(slot, "failed to rewind KV cache for banned_strings", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        slot.prompt.tokens.keep_first(rewind_prompt_n_tokens);
+        slot.smpl.reset(common_sampler_clone(slot.held_checkpoints[banned_token_idx].sampler.get()));
+
+        std::vector<completion_token_output> safe_prefix_tokens(
+                slot.held_token_outputs.begin(),
+                slot.held_token_outputs.begin() + banned_token_idx);
+        clear_banned_hold(slot);
+
+        for (auto & safe_prefix_token : safe_prefix_tokens) {
+            if (!process_visible_token(safe_prefix_token, slot)) {
+                return false;
+            }
+        }
+
+        std::vector<llama_logit_bias> extra_bias;
+        extra_bias.reserve(slot.rewind_failed_tokens.size());
+        for (llama_token tok : slot.rewind_failed_tokens) {
+            extra_bias.push_back({tok, -INFINITY});
+        }
+
+        result.tok = common_sampler_sample(
+                slot.smpl.get(),
+                ctx,
+                logits_idx,
+                false,
+                extra_bias);
+        if (result.tok == LLAMA_TOKEN_NULL) {
+            return fail_generation_on_banned_strings(slot, "retry exhausted candidate set");
+        }
+        result.text_to_send = common_token_to_piece(
+                ctx,
+                result.tok,
+                params_base.special ||
+                slot.task->params.sampling.preserved_tokens.find(result.tok) != slot.task->params.sampling.preserved_tokens.end());
+        result.prob = 1.0f;
+        result.probs.clear();
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, -1);
+        }
+
+        return process_token(result, slot, logits_idx);
+    }
+
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
-        if (post_sampling) {
+        if (post_sampling || idx < 0) {
             const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
             const size_t max_probs = cur_p->size;
             const size_t n_probs = std::min(max_probs, n_probs_request);
@@ -2867,8 +3081,6 @@ private:
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl.get(), id, true);
-
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
 
@@ -2891,11 +3103,13 @@ private:
                     populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
                 }
 
-                if (!process_token(result, slot)) {
-                    // release slot because of stop condition
+                if (!process_token(result, slot, tok_idx)) {
+                    // release slot because of stop condition or queued error
                     slot.print_timings();
-                    send_final_response(slot);
-                    metrics.on_prediction(slot);
+                    if (!slot.task_erred) {
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                    }
                     slot.release();
 
                     continue;
@@ -2945,10 +3159,12 @@ private:
 
                     // TODO: set result.probs
 
-                    if (!process_token(result, slot)) {
+                    if (!process_token(result, slot, -1)) {
                         slot.print_timings();
-                        send_final_response(slot);
-                        metrics.on_prediction(slot);
+                        if (!slot.task_erred) {
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                        }
                         slot.release();
 
                         break;
